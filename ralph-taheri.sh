@@ -303,8 +303,8 @@ ISSUE_EOF
 
   CLAUDE_OUTPUT_FILE=$(mktemp)
   CLAUDE_EXIT_CODE=0
-  claude --print --output-format stream-json --dangerously-skip-permissions --max-turns "$MAX_TURNS" \
-    < "$PROMPT_FILE" 2>&1 | tee "$CLAUDE_OUTPUT_FILE" | _format_stream &
+  claude --print --dangerously-skip-permissions --max-turns "$MAX_TURNS" \
+    < "$PROMPT_FILE" 2>&1 | tee "$CLAUDE_OUTPUT_FILE" &
   rm -f "$PROMPT_FILE"
   CLAUDE_PID=$!
 
@@ -326,6 +326,7 @@ ISSUE_EOF
 
   if [[ $CLAUDE_EXIT_CODE -ne 0 ]]; then
     log "Claude Code exited with code $CLAUDE_EXIT_CODE"
+    log "Output: $(head -20 <<< "$CLAUDE_OUTPUT")"
     failed=$((failed + 1))
     log_progress "Failed: $ISSUE_IDENTIFIER - Claude exited with code $CLAUDE_EXIT_CODE"
     continue
