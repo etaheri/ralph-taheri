@@ -105,6 +105,51 @@ cleanup() {
 }
 trap cleanup INT TERM
 
+# --- Stream formatter ---
+# Reads stream-json from stdin and prints readable summaries to stderr
+_format_stream() {
+  while IFS= read -r line; do
+    local type
+    type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+    case "$type" in
+      assistant)
+        # Assistant text output
+        local text
+        text=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text // empty' 2>/dev/null)
+        if [[ -n "$text" ]]; then
+          echo "$text" >&2
+        fi
+        ;;
+      result)
+        # Tool results (file reads, bash output, etc.)
+        local tool subtype
+        subtype=$(echo "$line" | jq -r '.subtype // empty' 2>/dev/null)
+        if [[ "$subtype" == "tool_use" ]]; then
+          tool=$(echo "$line" | jq -r '.tool_name // empty' 2>/dev/null)
+          local input_preview
+          case "$tool" in
+            Read|Glob|Grep)
+              input_preview=$(echo "$line" | jq -r '.tool_input.file_path // .tool_input.pattern // .tool_input.path // "" | .[0:80]' 2>/dev/null)
+              ;;
+            Bash)
+              input_preview=$(echo "$line" | jq -r '.tool_input.command // "" | .[0:80]' 2>/dev/null)
+              ;;
+            Edit|Write)
+              input_preview=$(echo "$line" | jq -r '.tool_input.file_path // "" | .[0:80]' 2>/dev/null)
+              ;;
+            *)
+              input_preview=""
+              ;;
+          esac
+          if [[ -n "$tool" ]]; then
+            echo "  [$tool] $input_preview" >&2
+          fi
+        fi
+        ;;
+    esac
+  done
+}
+
 # --- Logging helpers ---
 log() {
   local timestamp
@@ -240,7 +285,7 @@ while [[ $iteration -lt $MAX_ITERATIONS ]]; do
 
   CLAUDE_OUTPUT_FILE=$(mktemp)
   CLAUDE_EXIT_CODE=0
-  claude --print --dangerously-skip-permissions --max-turns "$MAX_TURNS" "$PROMPT
+  claude --output-format stream-json --dangerously-skip-permissions --max-turns "$MAX_TURNS" "$PROMPT
 
 ## Issue Details
 
@@ -254,7 +299,7 @@ $ISSUE_ACCEPTANCE_CRITERIA
 
 ---
 
-Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" &
+Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" | _format_stream &
   CLAUDE_PID=$!
 
   # Monitor output for completion signals — kill Claude early if it says it's done
