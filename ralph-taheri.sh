@@ -256,7 +256,18 @@ $ISSUE_ACCEPTANCE_CRITERIA
 
 Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" &
   CLAUDE_PID=$!
-  wait "$CLAUDE_PID" || CLAUDE_EXIT_CODE=$?
+
+  # Monitor output for completion signals — kill Claude early if it says it's done
+  while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+    if grep -qE "ISSUE_COMPLETE|COMPLETE|BLOCKED" "$CLAUDE_OUTPUT_FILE" 2>/dev/null; then
+      log "Detected completion signal — stopping Claude session"
+      kill "$CLAUDE_PID" 2>/dev/null
+      wait "$CLAUDE_PID" 2>/dev/null || true
+      break
+    fi
+    sleep 2
+  done
+  wait "$CLAUDE_PID" 2>/dev/null || CLAUDE_EXIT_CODE=$?
   CLAUDE_PID=""
 
   CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
