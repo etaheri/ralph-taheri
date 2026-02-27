@@ -18,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Defaults ---
 BACKEND="github"
 MAX_ITERATIONS=10
+MAX_TURNS=75
 VERIFY=false
 PUSH=false
 PROGRESS_FILE="progress.txt"
@@ -37,13 +38,18 @@ while [[ $# -gt 0 ]]; do
       PUSH=true
       shift
       ;;
+    --max-turns)
+      MAX_TURNS="$2"
+      shift 2
+      ;;
     --help|-h)
-      echo "Usage: $0 [--backend github|linear] [--verify] [--push] [max_iterations]"
+      echo "Usage: $0 [--backend github|linear] [--verify] [--push] [--max-turns N] [max_iterations]"
       echo ""
       echo "Options:"
       echo "  --backend github|linear   Issue backend (default: github)"
       echo "  --verify                  Enable agent-browser verification"
       echo "  --push                    Push after each successful iteration"
+      echo "  --max-turns N             Max Claude tool calls per issue (default: 75)"
       echo "  max_iterations            Max loop iterations (default: 10)"
       exit 0
       ;;
@@ -84,6 +90,20 @@ esac
 if [[ "$VERIFY" == "true" ]]; then
   source "${SCRIPT_DIR}/lib/verify.sh"
 fi
+
+# --- Trap handler for clean shutdown ---
+CLAUDE_PID=""
+cleanup() {
+  echo ""
+  log "Interrupted — cleaning up..."
+  if [[ -n "$CLAUDE_PID" ]] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill "$CLAUDE_PID" 2>/dev/null
+    wait "$CLAUDE_PID" 2>/dev/null || true
+    log "Killed Claude process ($CLAUDE_PID)"
+  fi
+  exit 130
+}
+trap cleanup INT TERM
 
 # --- Logging helpers ---
 log() {
@@ -133,6 +153,7 @@ fi
 log "Starting ralph-taheri agent loop"
 log "Backend: $(backend_name)"
 log "Max iterations: $MAX_ITERATIONS"
+log "Max turns per issue: $MAX_TURNS"
 log "Verification: $VERIFY"
 log "Push: $PUSH"
 log "---"
@@ -219,7 +240,7 @@ while [[ $iteration -lt $MAX_ITERATIONS ]]; do
 
   CLAUDE_OUTPUT_FILE=$(mktemp)
   CLAUDE_EXIT_CODE=0
-  claude --print --dangerously-skip-permissions "$PROMPT
+  claude --print --dangerously-skip-permissions --max-turns "$MAX_TURNS" "$PROMPT
 
 ## Issue Details
 
@@ -233,7 +254,10 @@ $ISSUE_ACCEPTANCE_CRITERIA
 
 ---
 
-Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" || CLAUDE_EXIT_CODE=$?
+Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" &
+  CLAUDE_PID=$!
+  wait "$CLAUDE_PID" || CLAUDE_EXIT_CODE=$?
+  CLAUDE_PID=""
 
   CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
   rm -f "$CLAUDE_OUTPUT_FILE"
