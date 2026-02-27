@@ -257,35 +257,19 @@ while [[ $iteration -lt $MAX_ITERATIONS ]]; do
     IS_LAST_ISSUE="true"
   fi
 
-  # Build the prompt by reading CLAUDE.md fresh each iteration
+  # Build the prompt file by reading CLAUDE.md fresh each iteration
   # (in case Claude updated project CLAUDE.md files in prior iterations)
-  PROMPT=$(cat "$CLAUDE_TEMPLATE")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_ID|${ISSUE_ID}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_IDENTIFIER|${ISSUE_IDENTIFIER}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_TITLE|${ISSUE_TITLE}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$IS_LAST_ISSUE|${IS_LAST_ISSUE}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$BACKEND|${BACKEND}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$ITERATION|${iteration}|g")
-  PROMPT=$(echo "$PROMPT" | sed "s|\\\$MAX_ITERATIONS|${MAX_ITERATIONS}|g")
+  PROMPT_FILE=$(mktemp)
+  sed -e "s|\\\$ISSUE_ID|${ISSUE_ID}|g" \
+      -e "s|\\\$ISSUE_IDENTIFIER|${ISSUE_IDENTIFIER}|g" \
+      -e "s|\\\$ISSUE_TITLE|${ISSUE_TITLE}|g" \
+      -e "s|\\\$IS_LAST_ISSUE|${IS_LAST_ISSUE}|g" \
+      -e "s|\\\$BACKEND|${BACKEND}|g" \
+      -e "s|\\\$ITERATION|${iteration}|g" \
+      -e "s|\\\$MAX_ITERATIONS|${MAX_ITERATIONS}|g" \
+      "$CLAUDE_TEMPLATE" > "$PROMPT_FILE"
 
-  # Export environment variables for Claude to access
-  export RALPH_ISSUE_BODY="$ISSUE_BODY"
-  export RALPH_ISSUE_AC="$ISSUE_ACCEPTANCE_CRITERIA"
-  export RALPH_ISSUE_ID="$ISSUE_ID"
-  export RALPH_ISSUE_IDENTIFIER="$ISSUE_IDENTIFIER"
-  export RALPH_ISSUE_TITLE="$ISSUE_TITLE"
-  export RALPH_IS_LAST_ISSUE="$IS_LAST_ISSUE"
-  export RALPH_BACKEND="$BACKEND"
-  export RALPH_ITERATION="$iteration"
-  export RALPH_MAX_ITERATIONS="$MAX_ITERATIONS"
-
-  # Run Claude Code with the prompt
-  log "Spawning Claude Code session..."
-  log_progress "Started: $ISSUE_IDENTIFIER - $ISSUE_TITLE (iteration $iteration)"
-
-  CLAUDE_OUTPUT_FILE=$(mktemp)
-  CLAUDE_EXIT_CODE=0
-  claude --output-format stream-json --dangerously-skip-permissions --max-turns "$MAX_TURNS" "$PROMPT
+  cat >> "$PROMPT_FILE" <<ISSUE_EOF
 
 ## Issue Details
 
@@ -299,7 +283,29 @@ $ISSUE_ACCEPTANCE_CRITERIA
 
 ---
 
-Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" | _format_stream &
+Implement this issue now. Follow the instructions in the prompt above.
+ISSUE_EOF
+
+  # Export environment variables for Claude to access
+  export RALPH_ISSUE_BODY="$ISSUE_BODY"
+  export RALPH_ISSUE_AC="$ISSUE_ACCEPTANCE_CRITERIA"
+  export RALPH_ISSUE_ID="$ISSUE_ID"
+  export RALPH_ISSUE_IDENTIFIER="$ISSUE_IDENTIFIER"
+  export RALPH_ISSUE_TITLE="$ISSUE_TITLE"
+  export RALPH_IS_LAST_ISSUE="$IS_LAST_ISSUE"
+  export RALPH_BACKEND="$BACKEND"
+  export RALPH_ITERATION="$iteration"
+  export RALPH_MAX_ITERATIONS="$MAX_ITERATIONS"
+
+  # Run Claude Code with the prompt piped via stdin
+  log "Spawning Claude Code session..."
+  log_progress "Started: $ISSUE_IDENTIFIER - $ISSUE_TITLE (iteration $iteration)"
+
+  CLAUDE_OUTPUT_FILE=$(mktemp)
+  CLAUDE_EXIT_CODE=0
+  claude --output-format stream-json --dangerously-skip-permissions --max-turns "$MAX_TURNS" \
+    < "$PROMPT_FILE" 2>&1 | tee "$CLAUDE_OUTPUT_FILE" | _format_stream &
+  rm -f "$PROMPT_FILE"
   CLAUDE_PID=$!
 
   # Monitor output for completion signals — kill Claude early if it says it's done
@@ -326,7 +332,7 @@ Implement this issue now. Follow the instructions in the prompt above." 2>&1 | t
   fi
 
   # Check for blocked signal
-  if echo "$CLAUDE_OUTPUT" | grep -q "<promise>BLOCKED</promise>"; then
+  if echo "$CLAUDE_OUTPUT" | grep -qE "(promise>BLOCKED|^BLOCKED$)"; then
     log "Claude reported BLOCKED for $ISSUE_IDENTIFIER"
     failed=$((failed + 1))
     log_progress "Blocked: $ISSUE_IDENTIFIER - Claude reported blocked"
@@ -385,7 +391,7 @@ Implement this issue now. Follow the instructions in the prompt above." 2>&1 | t
   log "---"
 
   # Check for full completion signal
-  if echo "$CLAUDE_OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+  if echo "$CLAUDE_OUTPUT" | grep -qE "(promise>COMPLETE|^COMPLETE$)"; then
     log "Claude signaled all work is COMPLETE"
     break
   fi
