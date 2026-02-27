@@ -338,7 +338,7 @@ ${blocked_by_text}"
                   success
                 }
               }
-            ' "$(jq -n --arg id "$issue_id" --arg rid "$dep_issue_id" '{issueId: $id, relatedIssueId: $rid, type: "blocks"}')" > /dev/null
+            ' "$(jq -n --arg id "$issue_id" --arg rid "$dep_issue_id" '{issueId: $rid, relatedIssueId: $id, type: "blocks"}')" > /dev/null
           fi
         fi
       done
