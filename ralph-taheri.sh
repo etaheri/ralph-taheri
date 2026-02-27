@@ -251,9 +251,11 @@ Implement this issue now. Follow the instructions in the prompt above." 2>&1 | t
     failed=$((failed + 1))
     log_progress "Blocked: $ISSUE_IDENTIFIER - Claude reported blocked"
 
-    # Re-mark as todo so it can be retried later
+    # Re-mark as blocked so it can be retried later
     if [[ "$BACKEND" == "github" ]]; then
+      _ensure_label "blocked" "d93f0b"
       gh issue edit "$ISSUE_ID" --add-label "blocked" --remove-label "in-progress" 2>/dev/null || true
+      project_move_issue "$ISSUE_ID" "todo"
     fi
     continue
   fi
@@ -275,7 +277,8 @@ Implement this issue now. Follow the instructions in the prompt above." 2>&1 | t
 
       # Re-mark as todo so it can be retried
       if [[ "$BACKEND" == "github" ]]; then
-        gh issue edit "$ISSUE_ID" --add-label "todo" --remove-label "in-progress" 2>/dev/null || true
+        gh issue edit "$ISSUE_ID" --remove-label "in-progress" 2>/dev/null || true
+        project_move_issue "$ISSUE_ID" "todo"
       fi
       continue
     fi

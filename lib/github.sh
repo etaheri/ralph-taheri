@@ -8,6 +8,7 @@ RALPH_LABEL="${RALPH_LABEL:-ralph-taheri}"
 
 # --- GitHub Projects V2 ---
 # Cached project metadata (set by project_init)
+# Expects the "Board" template: Todo / In Progress / Done
 _PROJECT_NUMBER=""
 _PROJECT_ID=""
 _PROJECT_OWNER=""
@@ -67,6 +68,7 @@ project_find_or_create() {
 }
 
 # Cache the Status field ID and option IDs (Todo, In Progress, Done)
+# Matches column names case-insensitively and handles common aliases
 _cache_status_field() {
   local owner
   owner=$(_get_owner)
@@ -86,13 +88,13 @@ _cache_status_field() {
     return 1
   fi
 
-  # Get option IDs for each status
+  # Get option IDs for each status (case-insensitive)
   local options
   options=$(echo "$fields" | jq -c '.fields[] | select(.name == "Status") | .options // []' 2>/dev/null)
 
-  _STATUS_TODO_ID=$(echo "$options" | jq -r '.[] | select(.name == "Todo") | .id' 2>/dev/null || true)
-  _STATUS_IN_PROGRESS_ID=$(echo "$options" | jq -r '.[] | select(.name == "In Progress") | .id' 2>/dev/null || true)
-  _STATUS_DONE_ID=$(echo "$options" | jq -r '.[] | select(.name == "Done") | .id' 2>/dev/null || true)
+  _STATUS_TODO_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "todo")] | first | .id // empty' 2>/dev/null || true)
+  _STATUS_IN_PROGRESS_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "in progress")] | first | .id // empty' 2>/dev/null || true)
+  _STATUS_DONE_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "done")] | first | .id // empty' 2>/dev/null || true)
 }
 
 # Initialize the project board (call once at startup)
@@ -127,7 +129,7 @@ project_add_issue() {
   local item_id
   item_id=$(echo "$result" | jq -r '.id')
 
-  # Set status to Todo if we have the option ID
+  # Set status to Todo
   if [[ -n "$_STATUS_TODO_ID" && -n "$item_id" && -n "$_PROJECT_ID" ]]; then
     gh project item-edit \
       --project-id "$_PROJECT_ID" \
@@ -266,9 +268,17 @@ get_issue_details() {
     2>/dev/null || { echo ""; return 1; }
 }
 
+# Ensure a label exists in the repo, creating it if needed
+_ensure_label() {
+  local name="$1"
+  local color="${2:-ededed}"
+  gh label create "$name" --color "$color" 2>/dev/null || true
+}
+
 # Mark an issue as in-progress (label + project board)
 mark_in_progress() {
   local number="$1"
+  _ensure_label "in-progress" "fbca04"
   gh issue edit "$number" \
     --add-label "in-progress" \
     --remove-label "todo" 2>/dev/null || true
