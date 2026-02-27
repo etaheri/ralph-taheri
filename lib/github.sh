@@ -1,10 +1,189 @@
 #!/usr/bin/env bash
 # GitHub Issues backend for ralph-taheri
-# Wraps the `gh` CLI for issue management
+# Wraps the `gh` CLI for issue management + GitHub Projects V2 kanban
 
 set -euo pipefail
 
 RALPH_LABEL="${RALPH_LABEL:-ralph-taheri}"
+
+# --- GitHub Projects V2 ---
+# Cached project metadata (set by project_init)
+_PROJECT_NUMBER=""
+_PROJECT_ID=""
+_PROJECT_OWNER=""
+_STATUS_FIELD_ID=""
+_STATUS_TODO_ID=""
+_STATUS_IN_PROGRESS_ID=""
+_STATUS_DONE_ID=""
+
+# Detect the repo owner (user or org) for project commands
+_get_owner() {
+  if [[ -n "$_PROJECT_OWNER" ]]; then
+    echo "$_PROJECT_OWNER"
+    return
+  fi
+  _PROJECT_OWNER=$(gh repo view --json owner --jq '.owner.login' 2>/dev/null || echo "")
+  echo "$_PROJECT_OWNER"
+}
+
+# Find an existing ralph-taheri project or create one
+# Sets _PROJECT_NUMBER and _PROJECT_ID
+project_find_or_create() {
+  local title="${1:-ralph-taheri}"
+  local owner
+  owner=$(_get_owner)
+
+  if [[ -z "$owner" ]]; then
+    echo "Warning: Could not determine repo owner, skipping project board" >&2
+    return 1
+  fi
+
+  # Search for existing project
+  local existing
+  existing=$(gh project list --owner "$owner" --format json --limit 50 2>/dev/null | \
+    jq -r --arg t "$title" '.projects[] | select(.title == $t) | "\(.number) \(.id)"' 2>/dev/null | head -1) || true
+
+  if [[ -n "$existing" ]]; then
+    _PROJECT_NUMBER=$(echo "$existing" | awk '{print $1}')
+    _PROJECT_ID=$(echo "$existing" | awk '{print $2}')
+    echo "Found existing project: #$_PROJECT_NUMBER" >&2
+  else
+    # Create new project
+    local result
+    result=$(gh project create --owner "$owner" --title "$title" --format json 2>/dev/null) || {
+      echo "Warning: Could not create project board (may need 'project' scope: gh auth refresh -s project)" >&2
+      return 1
+    }
+    _PROJECT_NUMBER=$(echo "$result" | jq -r '.number')
+    _PROJECT_ID=$(echo "$result" | jq -r '.id')
+    echo "Created project board: #$_PROJECT_NUMBER" >&2
+
+    # Link project to the current repo
+    gh project link "$_PROJECT_NUMBER" --owner "$owner" --repo "$(gh repo view --json nameWithOwner --jq '.nameWithOwner')" 2>/dev/null || true
+  fi
+
+  # Cache the Status field and its options
+  _cache_status_field
+}
+
+# Cache the Status field ID and option IDs (Todo, In Progress, Done)
+_cache_status_field() {
+  local owner
+  owner=$(_get_owner)
+
+  if [[ -z "$_PROJECT_NUMBER" ]]; then
+    return 1
+  fi
+
+  local fields
+  fields=$(gh project field-list "$_PROJECT_NUMBER" --owner "$owner" --format json 2>/dev/null) || return 1
+
+  # The Status field is a SingleSelectField with name "Status"
+  _STATUS_FIELD_ID=$(echo "$fields" | jq -r '.fields[] | select(.name == "Status") | .id' 2>/dev/null)
+
+  if [[ -z "$_STATUS_FIELD_ID" ]]; then
+    echo "Warning: No Status field found on project board" >&2
+    return 1
+  fi
+
+  # Get option IDs for each status
+  local options
+  options=$(echo "$fields" | jq -c '.fields[] | select(.name == "Status") | .options // []' 2>/dev/null)
+
+  _STATUS_TODO_ID=$(echo "$options" | jq -r '.[] | select(.name == "Todo") | .id' 2>/dev/null || true)
+  _STATUS_IN_PROGRESS_ID=$(echo "$options" | jq -r '.[] | select(.name == "In Progress") | .id' 2>/dev/null || true)
+  _STATUS_DONE_ID=$(echo "$options" | jq -r '.[] | select(.name == "Done") | .id' 2>/dev/null || true)
+}
+
+# Initialize the project board (call once at startup)
+# Returns 0 if project board is available, 1 if not
+project_init() {
+  local title="${1:-ralph-taheri}"
+  project_find_or_create "$title" 2>/dev/null
+}
+
+# Add an issue to the project board and set it to Todo
+project_add_issue() {
+  local issue_number="$1"
+  local owner
+  owner=$(_get_owner)
+
+  if [[ -z "$_PROJECT_NUMBER" || -z "$owner" ]]; then
+    return 0  # silently skip if no project
+  fi
+
+  local repo_url
+  repo_url=$(gh repo view --json url --jq '.url' 2>/dev/null)
+
+  local result
+  result=$(gh project item-add "$_PROJECT_NUMBER" \
+    --owner "$owner" \
+    --url "${repo_url}/issues/${issue_number}" \
+    --format json 2>/dev/null) || {
+    echo "Warning: Could not add issue #$issue_number to project board" >&2
+    return 0
+  }
+
+  local item_id
+  item_id=$(echo "$result" | jq -r '.id')
+
+  # Set status to Todo if we have the option ID
+  if [[ -n "$_STATUS_TODO_ID" && -n "$item_id" && -n "$_PROJECT_ID" ]]; then
+    gh project item-edit \
+      --project-id "$_PROJECT_ID" \
+      --id "$item_id" \
+      --field-id "$_STATUS_FIELD_ID" \
+      --single-select-option-id "$_STATUS_TODO_ID" 2>/dev/null || true
+  fi
+
+  echo "$item_id"
+}
+
+# Move an issue to a status column on the project board
+# status: "todo" | "in_progress" | "done"
+project_move_issue() {
+  local issue_number="$1"
+  local status="$2"
+  local owner
+  owner=$(_get_owner)
+
+  if [[ -z "$_PROJECT_NUMBER" || -z "$_PROJECT_ID" || -z "$owner" ]]; then
+    return 0  # silently skip if no project
+  fi
+
+  # Find the item ID for this issue in the project
+  local items
+  items=$(gh project item-list "$_PROJECT_NUMBER" --owner "$owner" --format json --limit 100 2>/dev/null) || return 0
+
+  local item_id
+  item_id=$(echo "$items" | jq -r --arg num "$issue_number" \
+    '.items[] | select(.content.number == ($num | tonumber)) | .id' 2>/dev/null | head -1) || true
+
+  if [[ -z "$item_id" ]]; then
+    # Issue not on board yet, try adding it
+    item_id=$(project_add_issue "$issue_number")
+  fi
+
+  if [[ -z "$item_id" ]]; then
+    return 0
+  fi
+
+  # Pick the right option ID
+  local option_id=""
+  case "$status" in
+    todo)        option_id="$_STATUS_TODO_ID" ;;
+    in_progress) option_id="$_STATUS_IN_PROGRESS_ID" ;;
+    done)        option_id="$_STATUS_DONE_ID" ;;
+  esac
+
+  if [[ -n "$option_id" && -n "$_STATUS_FIELD_ID" ]]; then
+    gh project item-edit \
+      --project-id "$_PROJECT_ID" \
+      --id "$item_id" \
+      --field-id "$_STATUS_FIELD_ID" \
+      --single-select-option-id "$option_id" 2>/dev/null || true
+  fi
+}
 
 # Get the next open issue labeled for ralph-taheri, sorted by priority
 # Priority: P0 > P1 > P2 > P3 > unlabeled
@@ -87,15 +266,16 @@ get_issue_details() {
     2>/dev/null || { echo ""; return 1; }
 }
 
-# Mark an issue as in-progress
+# Mark an issue as in-progress (label + project board)
 mark_in_progress() {
   local number="$1"
   gh issue edit "$number" \
     --add-label "in-progress" \
     --remove-label "todo" 2>/dev/null || true
+  project_move_issue "$number" "in_progress"
 }
 
-# Close an issue with a completion comment
+# Close an issue with a completion comment (label + project board)
 mark_done() {
   local number="$1"
   local comment="${2:-Completed by ralph-taheri agent loop.}"
@@ -106,6 +286,8 @@ mark_done() {
   # Clean up the in-progress label
   gh issue edit "$number" \
     --remove-label "in-progress" 2>/dev/null || true
+
+  project_move_issue "$number" "done"
 }
 
 # Count remaining open issues labeled for ralph-taheri

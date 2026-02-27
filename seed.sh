@@ -159,6 +159,19 @@ ISSUE_COUNT=$(echo "$ISSUES_JSON" | jq 'length')
 echo "Generated $ISSUE_COUNT issues"
 echo ""
 
+# --- Initialize project board (GitHub only) ---
+if [[ "$BACKEND" == "github" ]]; then
+  source "${SCRIPT_DIR}/lib/github.sh"
+  echo "Setting up GitHub Project board..."
+  if project_init "ralph-taheri"; then
+    echo "Project board ready: #$_PROJECT_NUMBER"
+    echo "View kanban: gh project view $_PROJECT_NUMBER --owner $(_get_owner) --web"
+  else
+    echo "Project board not available (optional — run: gh auth refresh -s project)"
+  fi
+  echo ""
+fi
+
 # --- Create issues ---
 # We need to create them in order so we can map dependency indices to real issue numbers
 declare -a CREATED_IDS=()
@@ -219,6 +232,9 @@ ${blocked_by_text}"
     issue_number=$(echo "$created" | grep -oE '[0-9]+$')
     CREATED_IDS+=("$issue_number")
     echo "  Created: #$issue_number"
+
+    # Add to project board
+    project_add_issue "$issue_number" >/dev/null 2>&1 || true
 
   elif [[ "$BACKEND" == "linear" ]]; then
     source "${SCRIPT_DIR}/lib/linear.sh"
@@ -358,6 +374,11 @@ for ((i = 0; i < ISSUE_COUNT; i++)); do
 done
 
 echo ""
+if [[ "$BACKEND" == "github" && -n "$_PROJECT_NUMBER" ]]; then
+  echo "View kanban board:"
+  echo "  gh project view $_PROJECT_NUMBER --owner $(_get_owner) --web"
+  echo ""
+fi
 echo "Run the agent loop:"
 if [[ "$BACKEND" == "github" ]]; then
   echo "  ./ralph-taheri.sh --backend github $ISSUE_COUNT"

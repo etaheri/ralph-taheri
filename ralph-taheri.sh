@@ -6,6 +6,7 @@
 #   ./ralph-taheri.sh --backend linear             # Linear, 10 iterations
 #   ./ralph-taheri.sh --backend github 20          # GitHub Issues, 20 iterations
 #   ./ralph-taheri.sh --backend linear --verify 10 # Linear + agent-browser verification
+#   ./ralph-taheri.sh --push 10                    # Push after each successful iteration
 #
 # Attribution:
 #   Based on snarktank/ralph (MIT) — https://github.com/snarktank/ralph
@@ -18,7 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND="github"
 MAX_ITERATIONS=10
 VERIFY=false
-PROGRESS_FILE="${SCRIPT_DIR}/progress.txt"
+PUSH=false
+PROGRESS_FILE="progress.txt"
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
@@ -31,12 +33,17 @@ while [[ $# -gt 0 ]]; do
       VERIFY=true
       shift
       ;;
+    --push)
+      PUSH=true
+      shift
+      ;;
     --help|-h)
-      echo "Usage: $0 [--backend github|linear] [--verify] [max_iterations]"
+      echo "Usage: $0 [--backend github|linear] [--verify] [--push] [max_iterations]"
       echo ""
       echo "Options:"
       echo "  --backend github|linear   Issue backend (default: github)"
       echo "  --verify                  Enable agent-browser verification"
+      echo "  --push                    Push after each successful iteration"
       echo "  max_iterations            Max loop iterations (default: 10)"
       exit 0
       ;;
@@ -91,6 +98,21 @@ log_progress() {
   echo "[$timestamp] $*" >> "$PROGRESS_FILE"
 }
 
+# --- Initialize progress.txt if it doesn't exist ---
+if [[ ! -f "$PROGRESS_FILE" ]]; then
+  cat > "$PROGRESS_FILE" <<'PROGRESS_INIT'
+## Codebase Patterns
+<!-- Add reusable patterns here as you discover them across iterations -->
+<!-- Example: Always use `IF NOT EXISTS` for migrations -->
+<!-- Example: Run `pnpm typecheck` before committing -->
+
+---
+
+# Ralph Progress Log
+PROGRESS_INIT
+  log "Initialized progress.txt"
+fi
+
 # --- Read CLAUDE.md template ---
 CLAUDE_TEMPLATE="${SCRIPT_DIR}/CLAUDE.md"
 if [[ ! -f "$CLAUDE_TEMPLATE" ]]; then
@@ -98,11 +120,21 @@ if [[ ! -f "$CLAUDE_TEMPLATE" ]]; then
   exit 1
 fi
 
+# --- Initialize project board (GitHub only) ---
+if [[ "$BACKEND" == "github" ]]; then
+  if project_init "ralph-taheri" 2>/dev/null; then
+    log "Project board ready: #$_PROJECT_NUMBER"
+  else
+    log "Project board not available (optional — run: gh auth refresh -s project)"
+  fi
+fi
+
 # --- Main loop ---
 log "Starting ralph-taheri agent loop"
 log "Backend: $(backend_name)"
 log "Max iterations: $MAX_ITERATIONS"
 log "Verification: $VERIFY"
+log "Push: $PUSH"
 log "---"
 
 iteration=0
@@ -159,16 +191,18 @@ while [[ $iteration -lt $MAX_ITERATIONS ]]; do
     IS_LAST_ISSUE="true"
   fi
 
-  # Build the prompt by injecting issue details into CLAUDE.md
+  # Build the prompt by reading CLAUDE.md fresh each iteration
+  # (in case Claude updated project CLAUDE.md files in prior iterations)
   PROMPT=$(cat "$CLAUDE_TEMPLATE")
   PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_ID|${ISSUE_ID}|g")
   PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_IDENTIFIER|${ISSUE_IDENTIFIER}|g")
   PROMPT=$(echo "$PROMPT" | sed "s|\\\$ISSUE_TITLE|${ISSUE_TITLE}|g")
   PROMPT=$(echo "$PROMPT" | sed "s|\\\$IS_LAST_ISSUE|${IS_LAST_ISSUE}|g")
   PROMPT=$(echo "$PROMPT" | sed "s|\\\$BACKEND|${BACKEND}|g")
+  PROMPT=$(echo "$PROMPT" | sed "s|\\\$ITERATION|${iteration}|g")
+  PROMPT=$(echo "$PROMPT" | sed "s|\\\$MAX_ITERATIONS|${MAX_ITERATIONS}|g")
 
-  # For body and acceptance criteria, use environment variables instead of sed
-  # (they may contain special characters)
+  # Export environment variables for Claude to access
   export RALPH_ISSUE_BODY="$ISSUE_BODY"
   export RALPH_ISSUE_AC="$ISSUE_ACCEPTANCE_CRITERIA"
   export RALPH_ISSUE_ID="$ISSUE_ID"
@@ -176,11 +210,14 @@ while [[ $iteration -lt $MAX_ITERATIONS ]]; do
   export RALPH_ISSUE_TITLE="$ISSUE_TITLE"
   export RALPH_IS_LAST_ISSUE="$IS_LAST_ISSUE"
   export RALPH_BACKEND="$BACKEND"
+  export RALPH_ITERATION="$iteration"
+  export RALPH_MAX_ITERATIONS="$MAX_ITERATIONS"
 
   # Run Claude Code with the prompt
   log "Spawning Claude Code session..."
-  log_progress "Started: $ISSUE_IDENTIFIER - $ISSUE_TITLE"
+  log_progress "Started: $ISSUE_IDENTIFIER - $ISSUE_TITLE (iteration $iteration)"
 
+  CLAUDE_OUTPUT_FILE=$(mktemp)
   CLAUDE_EXIT_CODE=0
   claude --print --dangerously-skip-permissions "$PROMPT
 
@@ -196,12 +233,28 @@ $ISSUE_ACCEPTANCE_CRITERIA
 
 ---
 
-Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee -a "$PROGRESS_FILE" || CLAUDE_EXIT_CODE=$?
+Implement this issue now. Follow the instructions in the prompt above." 2>&1 | tee "$CLAUDE_OUTPUT_FILE" || CLAUDE_EXIT_CODE=$?
+
+  CLAUDE_OUTPUT=$(cat "$CLAUDE_OUTPUT_FILE")
+  rm -f "$CLAUDE_OUTPUT_FILE"
 
   if [[ $CLAUDE_EXIT_CODE -ne 0 ]]; then
     log "Claude Code exited with code $CLAUDE_EXIT_CODE"
     failed=$((failed + 1))
     log_progress "Failed: $ISSUE_IDENTIFIER - Claude exited with code $CLAUDE_EXIT_CODE"
+    continue
+  fi
+
+  # Check for blocked signal
+  if echo "$CLAUDE_OUTPUT" | grep -q "<promise>BLOCKED</promise>"; then
+    log "Claude reported BLOCKED for $ISSUE_IDENTIFIER"
+    failed=$((failed + 1))
+    log_progress "Blocked: $ISSUE_IDENTIFIER - Claude reported blocked"
+
+    # Re-mark as todo so it can be retried later
+    if [[ "$BACKEND" == "github" ]]; then
+      gh issue edit "$ISSUE_ID" --add-label "blocked" --remove-label "in-progress" 2>/dev/null || true
+    fi
     continue
   fi
 
@@ -232,12 +285,29 @@ Implement this issue now. Follow the instructions in the prompt above." 2>&1 | t
 
   # Close the issue
   commit_msg=$(format_commit_message "$ISSUE_IDENTIFIER" "$ISSUE_TITLE")
-  mark_done "$ISSUE_ID" "Completed by ralph-taheri (iteration $iteration). Commit: $commit_msg"
+  mark_done "$ISSUE_ID" "Completed by ralph-taheri (iteration $iteration/$MAX_ITERATIONS). Commit: $commit_msg"
   completed=$((completed + 1))
 
   log "Closed $ISSUE_IDENTIFIER"
   log_progress "Completed: $ISSUE_IDENTIFIER - $ISSUE_TITLE"
+
+  # Push if requested
+  if [[ "$PUSH" == "true" ]]; then
+    log "Pushing changes..."
+    git push 2>/dev/null || {
+      log "Warning: git push failed (no remote configured or auth issue)"
+    }
+  fi
+
   log "---"
+
+  # Check for full completion signal
+  if echo "$CLAUDE_OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+    log "Claude signaled all work is COMPLETE"
+    break
+  fi
+
+  sleep 2
 done
 
 # --- Summary ---
