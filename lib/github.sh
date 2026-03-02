@@ -78,7 +78,10 @@ _cache_status_field() {
   fi
 
   local fields
-  fields=$(gh project field-list "$_PROJECT_NUMBER" --owner "$owner" --format json 2>/dev/null) || return 1
+  fields=$(gh project field-list "$_PROJECT_NUMBER" --owner "$owner" --format json 2>/dev/null) || {
+    echo "Warning: Could not fetch project fields" >&2
+    return 1
+  }
 
   # The Status field is a SingleSelectField with name "Status"
   _STATUS_FIELD_ID=$(echo "$fields" | jq -r '.fields[] | select(.name == "Status") | .id' 2>/dev/null)
@@ -89,12 +92,22 @@ _cache_status_field() {
   fi
 
   # Get option IDs for each status (case-insensitive)
-  local options
-  options=$(echo "$fields" | jq -c '.fields[] | select(.name == "Status") | .options // []' 2>/dev/null)
+  local status_options
+  status_options=$(echo "$fields" | jq -c '.fields[] | select(.name == "Status") | .options // []' 2>/dev/null)
 
-  _STATUS_TODO_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "todo")] | first | .id // empty' 2>/dev/null || true)
-  _STATUS_IN_PROGRESS_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "in progress")] | first | .id // empty' 2>/dev/null || true)
-  _STATUS_DONE_ID=$(echo "$options" | jq -r '[.[] | select(.name | ascii_downcase == "done")] | first | .id // empty' 2>/dev/null || true)
+  if [[ -z "$status_options" || "$status_options" == "[]" ]]; then
+    echo "Warning: No status options found on project board" >&2
+    return 1
+  fi
+
+  _STATUS_TODO_ID=$(echo "$status_options" | jq -r '[.[] | select(.name | ascii_downcase == "todo")][0].id // empty' 2>/dev/null || true)
+  _STATUS_IN_PROGRESS_ID=$(echo "$status_options" | jq -r '[.[] | select(.name | ascii_downcase == "in progress")][0].id // empty' 2>/dev/null || true)
+  _STATUS_DONE_ID=$(echo "$status_options" | jq -r '[.[] | select(.name | ascii_downcase == "done")][0].id // empty' 2>/dev/null || true)
+
+  if [[ -z "$_STATUS_IN_PROGRESS_ID" ]]; then
+    echo "Warning: Could not resolve 'In Progress' status option" >&2
+    return 1
+  fi
 }
 
 # Initialize the project board (call once at startup)
@@ -153,6 +166,14 @@ project_move_issue() {
     return 0  # silently skip if no project
   fi
 
+  # Lazy retry: if status IDs weren't cached at init, try again now
+  if [[ -z "$_STATUS_FIELD_ID" || -z "$_STATUS_IN_PROGRESS_ID" ]]; then
+    _cache_status_field 2>/dev/null || {
+      echo "Warning: Could not cache project status fields, skipping board move" >&2
+      return 0
+    }
+  fi
+
   # Find the item ID for this issue in the project
   local items
   items=$(gh project item-list "$_PROJECT_NUMBER" --owner "$owner" --format json --limit 100 2>/dev/null) || return 0
@@ -167,6 +188,7 @@ project_move_issue() {
   fi
 
   if [[ -z "$item_id" ]]; then
+    echo "Warning: Could not find or add issue #$issue_number to project board" >&2
     return 0
   fi
 
@@ -178,13 +200,18 @@ project_move_issue() {
     done)        option_id="$_STATUS_DONE_ID" ;;
   esac
 
-  if [[ -n "$option_id" && -n "$_STATUS_FIELD_ID" ]]; then
-    gh project item-edit \
-      --project-id "$_PROJECT_ID" \
-      --id "$item_id" \
-      --field-id "$_STATUS_FIELD_ID" \
-      --single-select-option-id "$option_id" 2>/dev/null || true
+  if [[ -z "$option_id" || -z "$_STATUS_FIELD_ID" ]]; then
+    echo "Warning: Missing status option ID for '$status', skipping board move" >&2
+    return 0
   fi
+
+  gh project item-edit \
+    --project-id "$_PROJECT_ID" \
+    --id "$item_id" \
+    --field-id "$_STATUS_FIELD_ID" \
+    --single-select-option-id "$option_id" 2>/dev/null || {
+    echo "Warning: Failed to move issue #$issue_number to '$status' on project board" >&2
+  }
 }
 
 # Get the next open issue labeled for ralph-taheri, sorted by priority
@@ -280,8 +307,7 @@ mark_in_progress() {
   local number="$1"
   _ensure_label "in-progress" "fbca04"
   gh issue edit "$number" \
-    --add-label "in-progress" \
-    --remove-label "todo" 2>/dev/null || true
+    --add-label "in-progress" >/dev/null 2>/dev/null || true
   project_move_issue "$number" "in_progress"
 }
 
@@ -295,7 +321,7 @@ mark_done() {
 
   # Clean up the in-progress label
   gh issue edit "$number" \
-    --remove-label "in-progress" 2>/dev/null || true
+    --remove-label "in-progress" >/dev/null 2>/dev/null || true
 
   project_move_issue "$number" "done"
 }
@@ -318,9 +344,9 @@ backend_name() {
 
 # Format a commit message for this backend
 format_commit_message() {
-  local issue_number="$1"
+  local identifier="$1"
   local title="$2"
-  echo "feat: #${issue_number} - ${title}"
+  echo "feat: ${identifier} - ${title}"
 }
 
 # Extract acceptance criteria from issue body

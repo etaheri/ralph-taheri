@@ -187,7 +187,7 @@ fi
 
 # --- Initialize project board (GitHub only) ---
 if [[ "$BACKEND" == "github" ]]; then
-  if project_init "ralph-taheri" 2>/dev/null; then
+  if project_init "ralph-taheri"; then
     log "Project board ready: #$_PROJECT_NUMBER"
   else
     log "Project board not available (optional — run: gh auth refresh -s project)"
